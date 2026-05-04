@@ -2,226 +2,193 @@ const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const cors = require("cors");
-const Razorpay = require("razorpay");
+const helmet = require("helmet");
+const compression = require("compression");
+const morgan = require("morgan");
+const rateLimit = require("express-rate-limit");
+const path = require("path");
+require("dotenv").config();
+
+const logger = require("./src/utils/logger");
+const connectDB = require("./src/config/db");
+const { initializeFirebase } = require("./src/config/firebase");
+const { connectRedis } = require("./src/config/redis");
+
+// Controllers
+const authController = require("./src/controllers/authController");
+const eventController = require("./src/controllers/eventController");
+const bookingController = require("./src/controllers/bookingController");
+const adminController = require("./src/controllers/adminController");
+const setupSocket = require("./src/controllers/socketController");
+const { verifyToken, isAdmin } = require("./src/middlewares/authMiddleware");
+const Seat = require("./src/models/Seat");
 
 const app = express();
-app.use(cors());
-app.use(express.json());
-
-const razorpay = new Razorpay({
-    key_id: "rzp_live_SUK1QREk8B67CK",
-    key_secret: "rcT0ZAKHW2kuC5SJPMXLXy4Y"
-});
-
 const server = http.createServer(app);
-
 const io = new Server(server, {
-    cors: {
-        origin: "*",
-        methods: ["GET", "POST"]
-    }
+    cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
-// =======================
-// 🔥 MONGO DB & SEAT MODEL
-// =======================
-const mongoose = require("mongoose");
-const Seat = require("./models/Seat");
+// ─── Global Middleware ────────────────────────────────────────
+app.use(cors());
 
-mongoose.connect("mongodb://127.0.0.1:27017/feedx")
-.then(() => console.log("MongoDB Connected 🔥"))
-.catch(err => console.log("Mongo Error:", err));
-// =======================
-// 🔌 SOCKET CONNECTION
-// =======================
-io.on("connection", (socket) => {
+// Helmet (relaxed for inline scripts used by frontend)
+app.use(helmet({
+    contentSecurityPolicy: false,
+    crossOriginEmbedderPolicy: false
+}));
 
-    console.log("User connected:", socket.id);
+app.use(compression());
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-    // 📤 SEND CURRENT SEAT STATE TO NEW USER
-    Seat.find().then(seatsData => {
-        let seatsObj = {};
-        seatsData.forEach(s => seatsObj[s.seatId] = s);
-        socket.emit("initSeats", seatsObj);
-    });
+// Morgan HTTP logging (skip health checks to reduce noise)
+app.use(morgan("short", {
+    skip: (req) => req.url === "/health",
+    stream: { write: (msg) => logger.info(msg.trim()) }
+}));
 
-    // 🔒 BULLETPROOF SEAT LOCK (NO RACE CONDITIONS)
-    socket.on("lockSeat", async ({ seatId }) => {
-        const seat = await Seat.findOne({ seatId });
-
-        if (seat && seat.status === "sold") {
-            socket.emit("seatTaken", seatId);
-            return;
-        }
-
-        if (seat && seat.status === "locked" && seat.expiry > Date.now()) {
-            socket.emit("seatTaken", seatId);
-            return;
-        }
-
-        await Seat.findOneAndUpdate(
-            { seatId },
-            {
-                seatId,
-                status: "locked",
-                userId: socket.id,
-                expiry: Date.now() + 300000 // 5 min
-            },
-            { upsert: true }
-        );
-
-        console.log(`Seat locked: ${seatId}`);
-        io.emit("seatLocked", seatId);
-    });
-
-    // 🔓 UNLOCK MANUALLY (optional)
-    socket.on("unlockSeat", async (seatId) => {
-        await Seat.deleteOne({ seatId });
-        io.emit("seatUnlocked", seatId);
-    });
-
-    // ❌ DISCONNECT (optional handling)
-    socket.on("disconnect", async () => {
-        console.log("User disconnected:", socket.id);
-
-        // OPTIONAL: release seats of this user
-        const userSeats = await Seat.find({ userId: socket.id, status: "locked" });
-        if (userSeats.length > 0) {
-            await Seat.updateMany(
-                { userId: socket.id, status: "locked" },
-                { status: "available", userId: null }
-            );
-            userSeats.forEach(s => io.emit("seatUnlocked", s.seatId));
-        }
-    });
-
+// ─── Rate Limiters ────────────────────────────────────────────
+const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 30,
+    message: { error: "Too many auth attempts, please try again later" },
+    standardHeaders: true,
+    legacyHeaders: false
 });
 
-// =======================
-// ⏳ AUTO UNLOCK (SERVER CONTROL)
-// =======================
-setInterval(async () => {
-    const expiredSeats = await Seat.find({ status: "locked", expiry: { $lt: Date.now() } });
-    if (expiredSeats.length > 0) {
+const apiLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 100,
+    message: { error: "Too many requests, please try again later" },
+    standardHeaders: true,
+    legacyHeaders: false
+});
+
+// ─── PUBLIC ROUTES ────────────────────────────────────────────
+app.post("/api/auth/firebase", authLimiter, authController.firebaseAuth);
+app.post("/api/auth/login", authLimiter, authController.login);
+app.post("/api/auth/register", authLimiter, authController.register);
+app.get("/api/events", eventController.getAllEvents);
+app.get("/api/events/:id", eventController.getEventById);
+app.get("/api/test", (req, res) => res.json({ message: "API is working", time: new Date() }));
+app.get("/api/booking/config", bookingController.getConfig);
+
+// Seats REST endpoint (public — needed for seat map rendering)
+app.get("/api/seats", async (req, res) => {
+    try {
+        const { eventId } = req.query;
+        if (!eventId) {
+            return res.status(400).json({ error: "eventId query parameter is required" });
+        }
+
+        const now = new Date();
+        // Auto-release expired locks before returning seat data
         await Seat.updateMany(
-            { status: "locked", expiry: { $lt: Date.now() } },
-            { status: "available", userId: null }
+            { eventId, status: "locked", expiresAt: { $lt: now } },
+            { status: "available", userId: null, expiresAt: null }
         );
-        // Sync refreshed state
-        expiredSeats.forEach(s => io.emit("seatUnlocked", s.seatId));
-        io.emit("refreshSeats");
-    }
-}, 5000);
 
-// =======================
-// 💳 RAZORPAY GATEWAY
-// =======================
-app.get("/create-order", (req, res) => {
-    res.send("Use POST request bro 😅");
-});
-
-app.post("/create-order", async (req, res) => {
-    try {
-        const options = {
-            amount: 4000, // ₹40
-            currency: "INR",
-            receipt: "receipt_" + Date.now()
-        };
-
-        const order = await razorpay.orders.create(options);
-        res.json(order);
-
+        const seats = await Seat.find({ eventId }).lean();
+        res.json(seats);
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: "Order failed" });
+        logger.error("Get Seats Error:", err);
+        res.status(500).json({ error: "Failed to fetch seats" });
     }
 });
 
-app.post("/verify-payment", async (req, res) => {
+// Admin login (public — no token required)
+app.post("/api/admin/login", authLimiter, adminController.adminLogin);
 
-    const crypto = require("crypto");
-
-    const {
-        razorpay_order_id,
-        razorpay_payment_id,
-        razorpay_signature,
-        seat
-    } = req.body;
-
-    const body = razorpay_order_id + "|" + razorpay_payment_id;
-
-    const expectedSignature = crypto
-        .createHmac("sha256", "rcT0ZAKHW2kuC5SJPMXLXy4Y")
-        .update(body.toString())
-        .digest("hex");
-
-    if (expectedSignature !== razorpay_signature) {
-        return res.status(400).json({ success: false });
+// Contact endpoint (simple — logs and returns success)
+app.post("/api/contact", apiLimiter, (req, res) => {
+    const { name, email, message } = req.body;
+    if (!name || !email || !message) {
+        return res.status(400).json({ error: "Name, email, and message are required" });
     }
+    logger.info(`📩 Contact Form: ${name} (${email}): ${message}`);
+    res.json({ success: true, message: "Message received. We'll get back to you soon!" });
+});
 
-    const seatData = await Seat.findOne({ seatId: seat });
+// ─── PROTECTED ROUTES ─────────────────────────────────────────
+app.post("/api/booking/create-order", verifyToken, bookingController.createOrder);
+app.post("/api/booking/verify-payment", verifyToken, bookingController.verifyPayment);
+app.get("/api/booking/user/bookings", verifyToken, bookingController.getUserBookings);
+app.get("/api/booking/user/pass/:id", verifyToken, bookingController.getBookingById);
 
-    if (!seatData || seatData.status !== "locked") {
-        return res.status(400).json({ success: false });
+// ─── ADMIN ROUTES ─────────────────────────────────────────────
+app.get("/api/admin/analytics", [verifyToken, isAdmin], adminController.getAnalytics);
+app.get("/api/admin/users", [verifyToken, isAdmin], adminController.getAllUsers);
+app.get("/api/admin/events", [verifyToken, isAdmin], adminController.manageEvents);
+app.post("/api/admin/events", [verifyToken, isAdmin], adminController.createEvent);
+app.post("/api/admin/approve-user", [verifyToken, isAdmin], adminController.approveUser);
+app.post("/api/admin/verify-pass", [verifyToken, isAdmin], adminController.verifyPass);
+
+
+// Health Check
+app.get("/health", (req, res) => res.status(200).send("OK"));
+
+// ─── Static Frontend ──────────────────────────────────────────
+// Development: Frontend runs on port 5173 via Vite
+// Production: Serve from frontend-v2/dist
+app.use(express.static(path.join(__dirname, "../frontend-v2/dist")));
+
+// Catch-all: serve index.html for client-side routing
+app.all(/.*/, (req, res, next) => {
+    if (req.originalUrl && req.originalUrl.startsWith("/api")) {
+        return res.status(404).json({ error: "Route not found" });
     }
-
-    await Seat.updateOne(
-        { seatId: seat },
-        {
-            status: "sold",
-            paymentId: razorpay_payment_id
+    res.sendFile(path.join(__dirname, "../frontend-v2/dist/index.html"), (err) => {
+        if (err) {
+            res.status(404).json({ error: "Frontend build not found. Please run 'npm run build' in frontend-v2 if you are in production mode." });
         }
-    );
-
-    console.log(`Seat SOLD: ${seat}`);
-
-    io.emit("seatSold", seat);
-
-    res.json({ success: true });
+    });
 });
 
-
-
-
-// =======================
-// 🧱 API TO FETCH ALL SEATS
-// =======================
-app.get("/get-seats", async (req, res) => {
-    const seats = await Seat.find();
-    res.json(seats);
+// ─── Global Error Handler ─────────────────────────────────────
+app.use((err, req, res, next) => {
+    logger.error("Unhandled Error:", {
+        message: err.message,
+        stack: err.stack,
+        url: req.originalUrl,
+        method: req.method
+    });
+    res.status(err.status || 500).json({
+        error: err.message || "Internal server error"
+    });
 });
 
-// =======================
-// 📊 API TO FETCH DASHBOARD STATS
-// =======================
-app.get("/get-dashboard", async (req, res) => {
+// ─── Initialize Connections ───────────────────────────────────
+connectDB();
+initializeFirebase();
+connectRedis();
+
+// ─── Background Jobs ──────────────────────────────────────────
+// Periodically clear expired seat locks (every 5 minutes)
+setInterval(async () => {
     try {
-        const totalSeats = 280; // 7 rows × 40 seats (adjust if needed)
-        const soldSeats = await Seat.countDocuments({ status: "sold" });
-        const revenue = soldSeats * 40;
-
-        res.json({
-            totalSeats,
-            soldSeats,
-            revenue
-        });
+        const now = new Date();
+        const result = await Seat.updateMany(
+            { status: "locked", expiresAt: { $lt: now } },
+            { status: "available", userId: null, expiresAt: null }
+        );
+        if (result.modifiedCount > 0) {
+            logger.info(`🧹 Background Cleanup: Released ${result.modifiedCount} expired seat locks`);
+            io.emit("seatUnlocked", { clearedAllExpired: true }); // Notify clients to refresh
+        }
     } catch (err) {
-        res.status(500).json({ error: "Failed to fetch dashboard stats" });
+        logger.error("Periodic Lock Cleanup Error:", err);
     }
+}, 5 * 60 * 1000);
+
+// ─── Wire up Socket.IO ───────────────────────────────────────
+setupSocket(io);
+
+const PORT = process.env.PORT || 5000;
+server.listen(PORT, '0.0.0.0', () => {
+    logger.info(`Server running on http://0.0.0.0:${PORT} 🚀`);
 });
 
-// =======================
-// 🏠 ROOT ROUTE
-// =======================
-app.get("/", (req, res) => {
-    res.send("Backend running 🔥");
-});
-
-// =======================
-// 🚀 START SERVER
-// =======================
-const PORT = 5000;
-
-server.listen(PORT, () => {
-    console.log(`Server running on http://localhost:${PORT} 🔥`);
+server.on('error', (err) => {
+    logger.error('Server Binding Error:', err);
 });
