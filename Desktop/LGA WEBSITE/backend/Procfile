@@ -1,0 +1,4 @@
+# PURPOSE: Provides an alternative process declaration for Node.js web hosts.
+# USAGE: Platforms that read Procfiles run this command to start the backend.
+
+web: npm start

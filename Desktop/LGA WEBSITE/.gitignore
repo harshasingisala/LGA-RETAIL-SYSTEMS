@@ -1,0 +1,22 @@
+# PURPOSE: Keeps generated artifacts, local secrets, and machine-specific files out of version control.
+# USAGE: Git reads this file automatically from the repository root.
+
+node_modules/
+__pycache__/
+*.pyc
+.env
+.env.local
+dist/
+build/
+.vite/
+*.egg-info/
+venv/
+.venv/
+.DS_Store
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pip-wheel-metadata/
+.pytest_cache/
+.coverage
+htmlcov/

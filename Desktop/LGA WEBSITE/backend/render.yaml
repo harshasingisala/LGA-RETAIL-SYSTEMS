@@ -1,0 +1,21 @@
+# PURPOSE: Defines Render deployment settings for the Express backend.
+# USAGE: Render reads this file when creating the backend web service from the repository.
+
+services:
+  - type: web
+    name: warehouse-backend
+    env: node
+    rootDir: backend
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: APP_VERSION
+        value: 1.0.0
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false
