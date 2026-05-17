@@ -1,33 +1,17 @@
-// PURPOSE: Stores shared frontend constants for routes, stock policy, and product categories.
-// USAGE: Import from this file instead of duplicating literal values across pages.
-
-export const CATEGORIES = [
-  "All",
-  "Shampoos",
-  "Soaps",
-  "Oils",
-  "Noodles",
-  "Tea/Coffee",
-  "Snacks",
-  "Cleaning",
-  "Personal Care",
-  "Staples",
-];
-
-export const STOCK_THRESHOLDS = {
-  default: 20,
-  staples: 50,
-  personal_care: 15,
-};
+// PURPOSE: Single source of truth for route paths and storage keys.
 
 export const ROUTES = {
-  login: "/login",
+  login:     "/login",
   dashboard: "/dashboard",
+  billing:   "/billing",
   inventory: "/inventory",
-  sales: "/sales",
+  sales:     "/sales",
   analytics: "/analytics",
 };
 
 export const APP_STORAGE_KEYS = {
-  session: "warehouse-mgmt-session",
+  // Only UI preferences remain in localStorage.
+  // Auth is now handled by Supabase (no session in localStorage).
+  theme: "lga:theme",
+  sidebarCollapsed: "lga:sidebar_collapsed",
 };

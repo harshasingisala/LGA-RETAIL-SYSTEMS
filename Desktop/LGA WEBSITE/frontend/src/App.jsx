@@ -1,75 +1,75 @@
-// PURPOSE: Defines application routing, local auth state, and protected app routes.
-// USAGE: Rendered by `main.jsx` as the root React component.
+// PURPOSE: Root router. Auth state comes from AuthContext (real Supabase session).
+// USAGE: Rendered by main.jsx wrapped in <AuthProvider>.
 
 import { lazy, Suspense } from "react";
 import { BrowserRouter, Navigate, Route, Routes, useLocation } from "react-router-dom";
-
+import { useAuth } from "./context/AuthContext";
 import { AppLayout } from "./layouts/AppLayout";
-import { DashboardPage } from "./pages/DashboardPage";
-import { InventoryPage } from "./pages/InventoryPage";
 import { LoginPage } from "./pages/LoginPage";
-import { SalesPage } from "./pages/SalesPage";
-import { useLocalStorage } from "./hooks/useLocalStorage";
-import { APP_STORAGE_KEYS, ROUTES } from "./utils/constants";
+import { ROUTES } from "./utils/constants";
 
-const AnalyticsPage = lazy(() =>
-  import("./pages/AnalyticsPage").then((module) => ({ default: module.AnalyticsPage })),
+const DashboardPage  = lazy(() => import("./pages/DashboardPage").then(m => ({ default: m.DashboardPage })));
+const InventoryPage  = lazy(() => import("./pages/InventoryPage").then(m => ({ default: m.InventoryPage })));
+const SalesPage      = lazy(() => import("./pages/SalesPage").then(m => ({ default: m.SalesPage })));
+const BillingPage    = lazy(() => import("./pages/BillingPage").then(m => ({ default: m.BillingPage })));
+const AnalyticsPage  = lazy(() => import("./pages/AnalyticsPage").then(m => ({ default: m.AnalyticsPage })));
+
+const PageLoader = () => (
+  <div className="flex h-48 items-center justify-center text-sm text-slate-500">
+    Loading…
+  </div>
 );
 
-function ProtectedRoute({ session, children }) {
+function ProtectedRoute({ children, requiredRole }) {
+  const { user, profile, loading } = useAuth();
   const location = useLocation();
 
-  if (!session?.isAuthenticated) {
-    return <Navigate to={ROUTES.login} replace state={{ from: location }} />;
+  if (loading) return <PageLoader />;
+  if (!user)   return <Navigate to={ROUTES.login} state={{ from: location }} replace />;
+  if (!profile?.is_active) return <Navigate to={ROUTES.login} replace />;
+
+  // Role guard (optional per-route)
+  const roleRank = { cashier: 1, manager: 2, admin: 3 };
+  if (requiredRole && (roleRank[profile?.role] ?? 0) < roleRank[requiredRole]) {
+    return <Navigate to={ROUTES.dashboard} replace />;
   }
 
   return children;
 }
 
-function RootRedirect({ session }) {
-  return <Navigate to={session?.isAuthenticated ? ROUTES.dashboard : ROUTES.login} replace />;
-}
-
 export default function App() {
-  const [session, setSession, clearSession] = useLocalStorage(APP_STORAGE_KEYS.session, {
-    isAuthenticated: false,
-    userName: "",
-  });
-
-  function handleLogin(userName) {
-    setSession({ isAuthenticated: true, userName });
-  }
-
   return (
     <BrowserRouter>
       <Routes>
-        <Route path="/" element={<RootRedirect session={session} />} />
-        <Route path={ROUTES.login} element={<LoginPage session={session} onLogin={handleLogin} />} />
+        <Route path="/" element={<Navigate to={ROUTES.dashboard} replace />} />
+        <Route path={ROUTES.login} element={<LoginPage />} />
+
         <Route
           element={
-            <ProtectedRoute session={session}>
-              <AppLayout onLogout={clearSession} />
+            <ProtectedRoute>
+              <AppLayout />
             </ProtectedRoute>
           }
         >
-          <Route path={ROUTES.dashboard} element={<DashboardPage />} />
-          <Route path={ROUTES.inventory} element={<InventoryPage />} />
-          <Route path={ROUTES.sales} element={<SalesPage />} />
-          <Route
-            path={ROUTES.analytics}
-            element={
-              <Suspense
-                fallback={
-                  <div className="rounded-lg border border-slate-200 bg-white p-4 text-sm font-semibold text-slate-600">
-                    Loading analytics...
-                  </div>
-                }
-              >
-                <AnalyticsPage />
-              </Suspense>
-            }
-          />
+          <Route path={ROUTES.dashboard} element={
+            <Suspense fallback={<PageLoader />}><DashboardPage /></Suspense>
+          }/>
+          <Route path={ROUTES.billing} element={
+            <Suspense fallback={<PageLoader />}><BillingPage /></Suspense>
+          }/>
+          <Route path={ROUTES.inventory} element={
+            <Suspense fallback={<PageLoader />}><InventoryPage /></Suspense>
+          }/>
+          <Route path={ROUTES.sales} element={
+            <Suspense fallback={<PageLoader />}><SalesPage /></Suspense>
+          }/>
+          <Route path={ROUTES.analytics} element={
+            <ProtectedRoute requiredRole="manager">
+              <Suspense fallback={<PageLoader />}><AnalyticsPage /></Suspense>
+            </ProtectedRoute>
+          }/>
         </Route>
+
         <Route path="*" element={<Navigate to={ROUTES.dashboard} replace />} />
       </Routes>
     </BrowserRouter>
